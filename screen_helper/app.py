@@ -47,6 +47,7 @@ class App:
 
     def capture(self, use_area: bool) -> None:
         """Прячем окно ответа, делаем снимок, (опционально) выбираем область, шлём в модель."""
+        was_visible = self.overlay.is_visible()  # чтобы вернуть окно на место, если выбор отменят
         try:
             self.overlay.hide()
             self.root.update()
@@ -55,6 +56,9 @@ class App:
             if use_area:
                 box = select_area(self.root, img)
                 if box is None:           # отмена или слишком маленькая рамка
+                    print("capture: выбор области отменён")
+                    if was_visible:       # прежний ответ или ошибка не должны пропадать из-за отмены
+                        self.overlay.show()
                     return
                 img = img.crop(box)
             self.start_request(img)
@@ -66,6 +70,7 @@ class App:
     def start_request(self, img) -> None:
         """Показываем «Думаю…» и запускаем запрос к модели в отдельном потоке."""
         rid, action = self.view.new_request()
+        print(f"request #{rid}: отправляю в {self.s.model}")  # для отладки в консоли
         self.apply(action)
         threading.Thread(
             target=ask_model,
@@ -92,12 +97,16 @@ class App:
                     use_area, t = val
                     if not self.gate.is_stale(t):  # дубли, пришедшие во время выбора, пропускаем
                         self.capture(use_area)
+                    else:
+                        print("capture: нажатие пропущено (пришло во время предыдущего снимка)")
                 elif kind == "toggle":
                     self.overlay.toggle()
                 elif kind == "quit":
                     self.root.destroy()
                     return
                 else:
+                    if kind in ("done", "error") and self.view.is_current(rid):
+                        print(f"request #{rid}: {'готово' if kind == 'done' else 'ошибка'}")
                     self.apply(self.view.handle(rid, kind, val))
         except queue.Empty:
             pass

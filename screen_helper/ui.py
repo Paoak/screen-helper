@@ -72,6 +72,12 @@ class Overlay:
     def hide(self) -> None:
         self.win.withdraw()
 
+    def show(self) -> None:
+        self.win.deiconify()
+
+    def is_visible(self) -> bool:
+        return self.win.state() != "withdrawn"
+
     def toggle(self) -> None:
         if self.win.state() == "withdrawn":
             self.win.deiconify()
