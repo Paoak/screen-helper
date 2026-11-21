@@ -1,0 +1,5 @@
+{
+  "_comment": "Пример смены модели. Убедитесь, что у модели есть capability vision (ollama show <модель>).",
+  "model": "qwen3-vl:8b",
+  "think": true
+}
