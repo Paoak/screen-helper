@@ -1,4 +1,4 @@
-"""Точка входа: python -m screen_helper [--config путь/к/config.json]."""
+"""Точка входа: python -m screen_helper [--config путь/к/config.gemma.json]."""
 from __future__ import annotations
 
 import argparse
@@ -14,7 +14,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         prog="screen_helper",
         description="Локальный ассистент: скриншот по хоткею -> ответ модели из Ollama.",
     )
-    parser.add_argument("--config", help="путь к config.json (по умолчанию - config.json в текущей папке)")
+    parser.add_argument("--config", help="путь к config.gemma.json (по умолчанию - config.gemma.json в текущей папке)")
     args = parser.parse_args(argv)
 
     try:

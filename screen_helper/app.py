@@ -12,7 +12,7 @@ import keyboard
 from PIL import ImageGrab
 
 from .config import Settings
-from .core import Action, AnswerView, HotkeyGate, ask_model
+from .core import Action, AnswerView, HotkeyGate, ask_model, empty_answer_message
 from .ui import Overlay, enable_dpi_awareness, select_area
 
 
@@ -26,7 +26,7 @@ class App:
         self.root.withdraw()              # главное окно не нужно, живём на Toplevel
         self.overlay = Overlay(self.root)
         self.q: "queue.Queue" = queue.Queue()  # сюда пишут и хоткеи, и поток с моделью
-        self.view = AnswerView()          # что показывать в окне ответа
+        self.view = AnswerView(empty_answer_message(settings))  # что показывать в окне ответа
         self.gate = HotkeyGate()          # защита от дублей хоткея
 
         # Из потока keyboard в tkinter лезть нельзя, поэтому шлём события в очередь
@@ -116,7 +116,11 @@ class App:
         s = self.s
         print(f"Готово. {s.hotkey_full} - экран, {s.hotkey_area} - область, "
               f"{s.hotkey_hide} - скрыть, {s.hotkey_quit} - выход")
-        print(f"Модель: {s.model} | think: {s.think} | num_ctx: {s.num_ctx}")
+        if s.backend == "openai":
+            print(f"Сервер: {s.openai_url} (llama-server / OpenAI API) | think: {s.think} "
+                  f"| reasoning_effort: {s.reasoning_effort}")
+        else:
+            print(f"Модель: {s.model} | think: {s.think} | num_ctx: {s.num_ctx}")
         try:
             self.root.mainloop()
         finally:

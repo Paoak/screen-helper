@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def write(tmp_path, data, encoding="utf-8"):
     """Записывает JSON-файл настроек и возвращает путь."""
-    p = tmp_path / "config.json"
+    p = tmp_path / "config.gemma.json"
     p.write_text(json.dumps(data, ensure_ascii=False), encoding=encoding)
     return p
 
@@ -53,7 +53,7 @@ def test_utf8_bom_is_accepted(tmp_path):
 
 
 def test_invalid_json(tmp_path):
-    p = tmp_path / "config.json"
+    p = tmp_path / "config.gemma.json"
     p.write_text("{ not json", encoding="utf-8")
     with pytest.raises(ConfigError, match="некорректный JSON"):
         load_settings(p)

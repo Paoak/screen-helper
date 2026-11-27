@@ -1,6 +1,7 @@
 """
-Логика без GUI и хоткеев: подготовка картинки, запрос к Ollama, разбор потока ответа,
-состояние окна ответа и защита от дублей хоткея. Всё это покрыто тестами (tests/).
+Логика без GUI и хоткеев: подготовка картинки, запрос к серверу модели (Ollama или
+OpenAI-совместимый llama-server), разбор потока ответа, состояние окна ответа и защита
+от дублей хоткея. Всё это покрыто тестами (tests/).
 """
 from __future__ import annotations
 
@@ -23,11 +24,20 @@ EMPTY_ANSWER_MSG = (
     "Модель закончила, но не вернула ответ. Возможно, ей не хватило контекста на рассуждение: "
     "увеличьте num_ctx или выключите think в настройках."
 )
+EMPTY_ANSWER_MSG_OPENAI = (
+    "Модель закончила, но не вернула ответ. Скорее всего, рассуждение съело весь лимит: задайте "
+    "reasoning_effort \"medium\", увеличьте max_tokens или контекст сервера (-c), либо выключите think."
+)
 THINK_UNSUPPORTED_MSG = "Эта модель не поддерживает режим рассуждения - отвечаю без него…"
 
 
+def empty_answer_message(settings: Settings) -> str:
+    """Что сказать, если модель закончила без ответа (советы зависят от бэкенда)."""
+    return EMPTY_ANSWER_MSG_OPENAI if settings.backend == "openai" else EMPTY_ANSWER_MSG
+
+
 class OllamaError(Exception):
-    """Ошибка, которую вернул сам сервер Ollama (HTTP-статус и/или текст ошибки)."""
+    """Ошибка, которую вернул сам сервер модели - Ollama или llama-server (статус и/или текст)."""
 
     def __init__(self, message: str, status: Optional[int] = None):
         super().__init__(message)
@@ -45,16 +55,74 @@ def prepare_image_b64(img: Image.Image, max_side: int) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
+def _sampling(settings: Settings) -> dict:
+    """Параметры сэмплинга, которые пользователь задал явно (остальные решает сервер)."""
+    pairs = (("temperature", settings.temperature), ("top_p", settings.top_p),
+             ("top_k", settings.top_k), ("min_p", settings.min_p))
+    return {name: value for name, value in pairs if value is not None}
+
+
+def _merge(payload: dict, extra: dict) -> dict:
+    """Добавляет в запрос поля из extra_body; вложенные объекты (chat_template_kwargs) сливает."""
+    for key, value in extra.items():
+        if isinstance(value, dict) and isinstance(payload.get(key), dict):
+            payload[key] = {**payload[key], **value}
+        else:
+            payload[key] = value
+    return payload
+
+
 def build_payload(image_b64: str, settings: Settings, think: Think) -> dict:
-    """Собирает тело запроса к /api/chat."""
-    return {
+    """Собирает тело запроса к Ollama (/api/chat)."""
+    options = {"num_ctx": settings.num_ctx, **_sampling(settings)}
+    if settings.max_tokens is not None:
+        options["num_predict"] = settings.max_tokens      # так в Ollama называется потолок длины
+    payload = {
         "model": settings.model,
         "stream": True,
         "think": think,
         "keep_alive": settings.keep_alive,
-        "options": {"num_ctx": settings.num_ctx},
+        "options": options,
         "messages": [{"role": "user", "content": settings.prompt, "images": [image_b64]}],
     }
+    return _merge(payload, settings.extra_body)
+
+
+def build_openai_payload(image_b64: str, settings: Settings, think: Think) -> dict:
+    """
+    Собирает тело запроса к OpenAI-совместимому серверу (llama-server: /v1/chat/completions).
+    Контекст (-c) и выгрузка слоёв на GPU задаются при запуске сервера, а не здесь.
+    Рассуждение:
+      think=False             - просим не рассуждать;
+      reasoning_effort / think="medium" - уровень рассуждения (передаём двумя способами:
+                                обычным полем и через chat_template_kwargs - так его видит шаблон модели).
+    """
+    payload = {
+        "model": settings.model,          # llama-server с одной моделью имя не проверяет
+        "stream": True,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": settings.prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+            ],
+        }],
+        **_sampling(settings),
+    }
+    if settings.max_tokens is not None:
+        payload["max_tokens"] = settings.max_tokens
+
+    template_kwargs: dict = {}
+    effort = settings.reasoning_effort or (think if isinstance(think, str) else None)
+    if think is False:
+        template_kwargs["enable_thinking"] = False
+        payload["thinking_budget_tokens"] = 0    # на новых сборках llama.cpp: 0 = без рассуждения
+    elif effort:
+        payload["reasoning_effort"] = effort
+        template_kwargs["reasoning_effort"] = effort
+    if template_kwargs:
+        payload["chat_template_kwargs"] = template_kwargs
+    return _merge(payload, settings.extra_body)
 
 
 def iter_events(lines: Iterable[Union[bytes, str]]) -> Iterator[Event]:
@@ -88,12 +156,63 @@ def iter_events(lines: Iterable[Union[bytes, str]]) -> Iterator[Event]:
             break
 
 
+def _error_message(err) -> str:
+    """Текст ошибки: у Ollama это строка, у llama-server - объект {"message": ..., "code": ...}."""
+    if isinstance(err, dict) and err.get("message"):
+        return str(err["message"])
+    return str(err)
+
+
+def iter_openai_events(lines: Iterable[Union[bytes, str]]) -> Iterator[Event]:
+    """
+    Разбирает поток SSE от OpenAI-совместимого сервера и выдаёт те же события, что iter_events:
+      ("think", N)     - идёт рассуждение (поле reasoning_content), всего N символов;
+      ("chunk", текст) - очередной кусок итогового ответа (поле content).
+    Строки вида «data: {...}»; «data: [DONE]» - конец. Комментарии, event: и битый JSON пропускаются,
+    «data: {"error": ...}» бросает OllamaError. Если сервер проигнорировал stream и прислал один
+    обычный JSON-объект, он тоже разбирается.
+    """
+    think_chars = 0
+    for raw in lines:
+        if not raw:
+            continue
+        text = (raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw).strip()
+        if text.startswith("data:"):
+            text = text[5:].strip()
+        elif not text.startswith("{"):
+            continue                       # ": keep-alive", "event: ..." и прочее
+        if text == "[DONE]":
+            break
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("error"):
+            raise OllamaError(_error_message(data["error"]))
+        choices = data.get("choices")
+        choice = choices[0] if isinstance(choices, list) and choices else None
+        if not isinstance(choice, dict):
+            continue                       # например, последний кусок со статистикой usage
+        delta = choice.get("delta") or choice.get("message") or {}
+        if not isinstance(delta, dict):
+            continue
+        thinking = delta.get("reasoning_content") or delta.get("reasoning")
+        if isinstance(thinking, str) and thinking:
+            think_chars += len(thinking)
+            yield ("think", think_chars)
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            yield ("chunk", content)
+
+
 def _error_text(resp) -> str:
-    """Достаёт текст ошибки из ответа Ollama ({"error": "..."} или сырое тело)."""
+    """Достаёт текст ошибки из ответа сервера (Ollama: {"error": "..."}, llama-server: {"error": {...}})."""
     try:
         body = resp.json()
         if isinstance(body, dict) and body.get("error"):
-            return str(body["error"])
+            return _error_message(body["error"])
     except Exception:
         pass
     return resp.text or f"HTTP {resp.status_code}"
@@ -104,16 +223,46 @@ def _is_think_unsupported(err: OllamaError) -> bool:
     return err.status == 400 and "think" in str(err).lower()
 
 
+def _openai_error(exc: OllamaError, settings: Settings) -> str:
+    """Подсказки для типичных ошибок llama-server."""
+    text, low = str(exc), str(exc).lower()
+    if "mmproj" in low or "image input is not supported" in low:
+        return ("Сервер запущен без модуля зрения, поэтому картинки не принимает. "
+                "Запустите llama-server с флагом --mmproj <файл проектора> (или скриптом PrismML, "
+                "который подключает его сам).")
+    if exc.status == 503 or "loading model" in low:
+        return "Сервер ещё загружает модель. Подождите немного и повторите."
+    if "context size" in low or "exceed_context" in low:
+        return ("Скриншот и рассуждение не поместились в контекст сервера. Запустите llama-server "
+                "с большим -c (например -c 16384) или уменьшите max_side в настройках.")
+    if exc.status == 404:
+        return (f"Сервер ответил 404 по адресу {settings.openai_url}. "
+                "Адрес должен заканчиваться на /v1/chat/completions.")
+    if "memory" in low or "failed to allocate" in low:
+        return (f"Не хватает памяти: {text}. Запустите сервер с меньшим -c, "
+                "квантованным KV-кэшем или более лёгкой сборкой модели.")
+    return f"Сервер вернул ошибку: {text}"
+
+
 def friendly_error(exc: Exception, settings: Settings) -> str:
     """Превращает исключение в понятное пользователю сообщение с подсказкой, что делать."""
+    openai = settings.backend == "openai"
     # ConnectTimeout наследует и ConnectionError, и Timeout - ConnectionError проверяем первым
     if isinstance(exc, requests.ConnectionError):
+        if openai:
+            return (f"Не удаётся подключиться к серверу ({settings.openai_url}). Запущен ли llama-server? "
+                    "Адрес и порт должны совпадать с --host/--port сервера (по умолчанию 8080).")
         return (f"Не удаётся подключиться к Ollama ({settings.ollama_url}). "
                 "Запущена ли Ollama? Проверьте командой: ollama list")
     if isinstance(exc, requests.Timeout):
+        if openai:
+            return (f"Сервер не отвечает больше {settings.request_timeout} с. Модель могла загружаться "
+                    "или слишком долго рассуждать: попробуйте reasoning_effort \"medium\" или отключите think.")
         return (f"Ollama не отвечает больше {settings.request_timeout} с. Модель могла "
                 "загружаться или слишком долго рассуждать: попробуйте ещё раз или отключите think.")
     if isinstance(exc, OllamaError):
+        if openai:
+            return _openai_error(exc, settings)
         text = str(exc)
         if exc.status == 404 or "not found" in text.lower():
             return (f"Модель «{settings.model}» не найдена. "
@@ -128,15 +277,17 @@ def friendly_error(exc: Exception, settings: Settings) -> str:
 def _stream(b64: str, think: Think, rid: int, out_q, is_current: Callable[[], bool],
             settings: Settings, post) -> bool:
     """
-    Один запрос к Ollama; события кладёт в очередь.
+    Один запрос к серверу модели (Ollama или llama-server); события кладёт в очередь.
     Возвращает True, если поток дочитан, и False, если запрос оборван как устаревший.
     """
-    payload = build_payload(b64, settings, think)
-    with post(settings.ollama_url, json=payload, stream=True,
+    openai = settings.backend == "openai"
+    payload = (build_openai_payload if openai else build_payload)(b64, settings, think)
+    events = iter_openai_events if openai else iter_events
+    with post(settings.api_url, json=payload, stream=True,
               timeout=settings.request_timeout) as resp:
         if resp.status_code >= 400:
             raise OllamaError(_error_text(resp), resp.status_code)
-        for kind, val in iter_events(resp.iter_lines()):
+        for kind, val in events(resp.iter_lines()):
             if not is_current():          # пришёл новый запрос - выходим, соединение закроется
                 return False
             out_q.put((rid, kind, val))
@@ -146,9 +297,9 @@ def _stream(b64: str, think: Think, rid: int, out_q, is_current: Callable[[], bo
 def ask_model(img: Image.Image, rid: int, out_q, is_current: Callable[[], bool],
               settings: Settings, post=requests.post) -> None:
     """
-    Отправляет снимок в Ollama и кладёт события (rid, kind, value) в очередь out_q.
+    Отправляет снимок на сервер модели и кладёт события (rid, kind, value) в очередь out_q.
     Работает в отдельном потоке. Виды событий: think, chunk, notice, error, done.
-    Если модель не поддерживает think - один раз повторяет запрос без рассуждения.
+    Ollama: если модель не поддерживает think - один раз повторяет запрос без рассуждения.
     post вынесен параметром, чтобы в тестах подменять сетевой вызов.
     """
     try:
@@ -156,7 +307,8 @@ def ask_model(img: Image.Image, rid: int, out_q, is_current: Callable[[], bool],
         try:
             completed = _stream(b64, settings.think, rid, out_q, is_current, settings, post)
         except OllamaError as e:
-            if settings.think is not False and _is_think_unsupported(e):
+            if (settings.backend == "ollama" and settings.think is not False
+                    and _is_think_unsupported(e)):
                 out_q.put((rid, "notice", THINK_UNSUPPORTED_MSG))
                 completed = _stream(b64, False, rid, out_q, is_current, settings, post)
             else:
@@ -176,7 +328,8 @@ class AnswerView:
     Не зависит от tkinter: возвращает «действия» ("set", текст) или ("append", текст).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, empty_msg: str = EMPTY_ANSWER_MSG) -> None:
+        self.empty_msg = empty_msg    # что показать, если ответа не было
         self.rid = 0                  # номер текущего запроса
         self.got_chunk = False        # пришёл ли уже хоть один кусок ответа
 
@@ -207,7 +360,7 @@ class AnswerView:
                 return ("append", f"\n\n[Ошибка: {val}]")
             return ("set", f"Ошибка: {val}")
         if kind == "done":
-            return None if self.got_chunk else ("set", EMPTY_ANSWER_MSG)
+            return None if self.got_chunk else ("set", self.empty_msg)
         return None
 
 
